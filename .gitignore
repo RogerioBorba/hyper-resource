@@ -1,0 +1,25 @@
+#config files
+.idea/*
+
+#cache files
+.cache/*
+
+#compiled files
+*.pyc
+
+#temp files
+*~
+
+#migrations
+*/migrations/*
+
+#static
+administrativo/static_root/*
+static_root/*
+
+#media
+administrativo/media_root/*
+media_root/*
+
+#nginx
+nginx/*
