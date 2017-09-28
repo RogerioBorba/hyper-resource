@@ -1,7 +1,8 @@
-from __future__ import unicode_literals
 import ast
 import re
 import json
+
+import jwt
 import requests
 
 from django.contrib.gis.db.models.functions import AsGeoJSON
@@ -23,6 +24,8 @@ from abc import ABCMeta, abstractmethod
 
 
 from hyper_resource.models import  FactoryComplexQuery, OperationController, BusinessModel, ConverterType
+from .admin import TOKEN_NEED, SECRET_KEY
+
 
 class IgnoreClientContentNegotiation(BaseContentNegotiation):
     def select_parser(self, request, parsers):
@@ -115,7 +118,6 @@ class BaseContext(object):
         contextdata = self.addIriTamplate(contextdata, request, self.serializer_object)
         return contextdata
 
-
 class AbstractResource(APIView):
     __metaclass__ = ABCMeta
 
@@ -130,9 +132,33 @@ class AbstractResource(APIView):
         self.initialize_context()
         self.iri_metadata = None
         self.operation_controller = OperationController()
-
+        self.token_need = self.token_is_need()
 
     content_negotiation_class = IgnoreClientContentNegotiation
+
+    def jwt_algorithm(self):
+        return 'HS256'
+
+    def token_is_ok(self, a_token):
+        try:
+            payload = jwt.decode(a_token, SECRET_KEY, algorithm=self.jwt_algorithm())
+            return True
+        except jwt.InvalidTokenError:
+            return False
+
+    def token_is_need(self):
+        return  False
+
+    def dispatch(self, request, *args, **kwargs):
+        if self.token_is_need():
+            http_auth = 'HTTP_AUTHORIZATION'
+            if http_auth in request.META and request.META[http_auth].startswith('Bearer'):
+                a_token = request.META['HTTP_AUTHORIZATION'][7:].strip()
+                if self.token_is_ok(a_token):
+                    return super(AbstractResource, self).dispatch(request, *args, **kwargs)
+            return HttpResponse(json.dumps({"token": "token is needed or it is not ok"}), status=401,  content_type='application/json')
+        else:
+           return  super(AbstractResource, self).dispatch(request, *args, **kwargs)
 
     @abstractmethod #Must be override
     def initialize_context(self):
@@ -282,7 +308,7 @@ class AbstractResource(APIView):
             return True
         if self._has_method(attrs_functs[0]):
             return False
-        return hasattr(self.object_model, attrs_functs[0])
+        return self.object_model.is_attribute(attrs_functs[0])
 
     def transform_path_with_url_as_array(self, arr_of_term):
 
@@ -391,14 +417,12 @@ class AbstractResource(APIView):
         self.name_of_last_operation_executed = attribute_or_function_name_striped
         if self.is_attribute_for(object, attribute_or_function_name):
             return getattr(object, attribute_or_function_name_striped)
-
         if len(parameters)> 0:
             if (isinstance(object, BusinessModel) or isinstance(object, GEOSGeometry)):
                 params = self.all_parameters_converted(attribute_or_function_name_striped, parameters)
             else:
                 params = ConverterType().convert_parameters(type(object), attribute_or_function_name, parameters)
             return getattr(object, attribute_or_function_name_striped)(*params)
-
         return getattr(object, attribute_or_function_name_striped)()
 
     def parametersConverted(self, params_as_array):
@@ -448,7 +472,6 @@ class AbstractResource(APIView):
 
 class NonSpatialResource(AbstractResource):
 
-
     def response_of_request(self,  attributes_functions_str):
         att_funcs = attributes_functions_str.split('/')
         if (not self.is_operation(att_funcs[0])) and self.is_attribute(att_funcs[0]):
@@ -459,7 +482,10 @@ class NonSpatialResource(AbstractResource):
         if hasattr(self.current_object_state, 'model') and issubclass(self.current_object_state.model, Model):
             class_name = self.current_object_state.model.__name__ + 'Serializer'
             serializer_cls = self.object_model.class_for_name(self.serializer_class.__module__, class_name)
-            if isinstance(self.current_object_state.field, OneToOneField):
+            if isinstance(self.current_object_state, QuerySet):
+                self.current_object_state = serializer_cls(self.current_object_state, many=True,
+                                                           context={'request': self.request}).data
+            elif isinstance(self.current_object_state.field, OneToOneField):
                 self.current_object_state = serializer_cls(self.current_object_state, context={'request': self.request}).data
             else:
                 self.current_object_state = serializer_cls(self.current_object_state, many=True, context={'request': self.request}).data
@@ -517,6 +543,8 @@ class NonSpatialResource(AbstractResource):
         #return self.context_resource.context()
         return Response ( data=self.context_resource.context(), content_type='application/ld+json' )
 
+class StyleResource(AbstractResource):
+    pass
 
 class SpatialResource(AbstractResource):
 
@@ -679,6 +707,8 @@ class SpatialResource(AbstractResource):
             return (a_value, 'application/vnd.geo+json', geom, {'status': 200})
         elif isinstance(a_value, SpatialReference):
            a_value = { self.name_of_last_operation_executed: a_value.pretty_wkt}
+        elif isinstance(a_value, memoryview):
+            return (a_value, 'application/octet-stream', self.object_model, {'status': 200})
         else:
             a_value = {self.name_of_last_operation_executed: a_value}
 
@@ -755,7 +785,8 @@ class FeatureResource(SpatialResource):
             else:
                 return Response({'Erro': 'The server can generate an image only from a geometry data'},
                                 status=status.HTTP_404_NOT_FOUND)
-
+        if dict_for_response[1] =='application/octet-stream':
+            return HttpResponse(dict_for_response[0], content_type='application/octet-stream')
         return Response(data=dict_for_response[0], content_type=dict_for_response[1])
 
     def options(self, request, *args, **kwargs):
@@ -805,6 +836,10 @@ class AbstractCollectionResource(AbstractResource):
         att_funcs = attributes_functions_str.split('/')
         return len(att_funcs) > 1 and  (att_funcs[0].lower() == 'filter')
 
+    def path_has_map_operation(self, attributes_functions_str):
+        att_funcs = attributes_functions_str.split('/')
+        return len(att_funcs) > 1 and (att_funcs[0].lower() == 'map')
+
 
     def q_object_for_filter_array_of_terms(self, array_of_terms):
         return FactoryComplexQuery().q_object_for_filter_expression(None, self.model_class(), array_of_terms)
@@ -818,6 +853,10 @@ class AbstractCollectionResource(AbstractResource):
         return self.q_object_for_filter_array_of_terms(arr[1:])
 
     def get_objects_from_filter_operation(self, attributes_functions_str):
+        q_object = self.q_object_for_filter_expression(attributes_functions_str)
+        return self.model_class().objects.filter(q_object)
+
+    def get_objects_from_map_operation(self, attributes_functions_str):
         q_object = self.q_object_for_filter_expression(attributes_functions_str)
         return self.model_class().objects.filter(q_object)
 
@@ -838,17 +877,17 @@ class AbstractCollectionResource(AbstractResource):
         #return self.context_resource.context()
         return Response ( data=self.context_resource.context(), content_type='application/ld+json' )
 
-    def basic_response(self, request, model_object):
+    def basic_post(self, request):
         response =  Response(status=status.HTTP_201_CREATED, content_type='application/json')
-        response['Content-Location'] = request.path + str(model_object.id)
+        response['Content-Location'] = request.path + str(self.object_model.id)
         return response
 
     def post(self, request, *args, **kwargs):
-        print(request.data)
         serializer = self.serializer_class(data=request.data, context={'request': request})
         if serializer.is_valid():
             obj =  serializer.save()
-            return self.basic_response(request, obj)
+            self.object_model = obj
+            return self.basic_post(request)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class CollectionResource(AbstractCollectionResource):
@@ -910,6 +949,9 @@ class SpatialCollectionResource(AbstractCollectionResource):
 
     def operation_names_model(self):
         return self.operation_controller.feature_collection_operations_dict().keys()
+
+    def path_has_only_spatial_operation(self, attributes_functions_str):
+        pass
 
 class FeatureCollectionResource(SpatialCollectionResource):
 
@@ -996,7 +1038,8 @@ class FeatureCollectionResource(SpatialCollectionResource):
         objects = []
         if self.path_has_filter_operation(attributes_functions_str) or self.path_has_spatial_operation(attributes_functions_str) or  self.is_filter_with_spatial_operation(attributes_functions_str):
             objects = self.get_objects_from_filter_operation(attributes_functions_str)
-
+        elif self.path_has_map_operation(attributes_functions_str):
+            objects = self.get_objects_from_map_operation(attributes_functions_str)
 
         return self.serializer_class(objects, many=True).data
 
